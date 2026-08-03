@@ -292,6 +292,17 @@ struct SiftLookupResult: Sendable {
 }
 
 enum SiftLookupService {
+    private struct Endpoint: Sendable {
+        let source: String
+        let bases: [String]
+    }
+
+    private enum FetchOutcome: Sendable {
+        case product(SiftProduct)
+        case notFound
+        case networkFailure
+    }
+
     private struct Envelope: Decodable {
         let status: Int?
         let product: RemoteProduct?
@@ -304,7 +315,7 @@ enum SiftLookupService {
         let categoriesTags: [String]?
         let ingredientsText: String?
         let ingredientsTextEnglish: String?
-        let imageURL: URL?
+        let imageURLString: String?
 
         enum CodingKeys: String, CodingKey {
             case productName = "product_name"
@@ -313,7 +324,7 @@ enum SiftLookupService {
             case categoriesTags = "categories_tags"
             case ingredientsText = "ingredients_text"
             case ingredientsTextEnglish = "ingredients_text_en"
-            case imageURL = "image_url"
+            case imageURLString = "image_url"
         }
     }
 
@@ -322,36 +333,102 @@ enum SiftLookupService {
             return SiftLookupResult(product: sample, errorMessage: nil)
         }
 
-        let domains = [
-            ("https://world.openfoodfacts.org/api/v2/product/", "Open Food Facts"),
-            ("https://world.openbeautyfacts.org/api/v2/product/", "Open Beauty Facts")
+        // The .net Open Food Facts host is the current documented API host. Keep
+        // the legacy .org and the sister catalogs as fallbacks because DNS/CDN
+        // availability can vary by carrier and region.
+        let endpoints = [
+            Endpoint(
+                source: "Open Food Facts",
+                bases: [
+                    "https://world.openfoodfacts.net/api/v3/product/",
+                    "https://world.openfoodfacts.org/api/v2/product/"
+                ]
+            ),
+            Endpoint(
+                source: "Open Beauty Facts",
+                bases: [
+                    "https://world.openbeautyfacts.org/api/v3/product/",
+                    "https://world.openbeautyfacts.org/api/v2/product/"
+                ]
+            ),
+            Endpoint(
+                source: "Open Products Facts",
+                bases: ["https://world.openproductsfacts.org/api/v3/product/"]
+            )
         ]
 
         var sawNetworkError = false
-        for (base, source) in domains {
-            guard let url = URL(string: "\(base)\(barcode).json?fields=product_name,product_name_en,brands,categories_tags,ingredients_text,ingredients_text_en,image_url") else { continue }
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 8
-            request.cachePolicy = .returnCacheDataElseLoad
+        let foundProduct: SiftProduct? = await withTaskGroup(of: FetchOutcome.self, returning: SiftProduct?.self) { group in
+            for endpoint in endpoints {
+                group.addTask {
+                    await fetch(barcode: barcode, endpoint: endpoint)
+                }
+            }
 
-            do {
-                let (data, response) = try await URLSession.shared.data(for: request)
-                guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
+            for await outcome in group {
+                switch outcome {
+                case .product(let product):
+                    group.cancelAll()
+                    return product
+                case .networkFailure:
                     sawNetworkError = true
+                case .notFound:
                     continue
                 }
-                let envelope = try JSONDecoder().decode(Envelope.self, from: data)
-                guard envelope.status != 0, let remote = envelope.product else { continue }
-                return SiftLookupResult(product: makeProduct(barcode: barcode, remote: remote, source: source), errorMessage: nil)
-            } catch {
-                sawNetworkError = true
             }
+            return nil
+        }
+
+        if let foundProduct {
+            return SiftLookupResult(product: foundProduct, errorMessage: nil)
         }
 
         return SiftLookupResult(
             product: nil,
-            errorMessage: sawNetworkError ? "The product database could not be reached. You can still paste ingredients to check them." : nil
+            errorMessage: sawNetworkError
+                ? "The product database is temporarily unavailable. Check your connection and try again, or paste the ingredients instead."
+                : "No product was found for this barcode. Paste the ingredients to check them."
         )
+    }
+
+    private static func fetch(barcode: String, endpoint: Endpoint) async -> FetchOutcome {
+        var sawNetworkFailure = false
+        for base in endpoint.bases {
+            guard let url = URL(string: "\(base)\(barcode).json?product_type=all&lc=en&fields=product_name,product_name_en,brands,categories_tags,ingredients_text,ingredients_text_en,image_url") else {
+                continue
+            }
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 6
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue("Sift/1.0 (iOS; com.sift.health)", forHTTPHeaderField: "User-Agent")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    sawNetworkFailure = true
+                    continue
+                }
+                guard 200..<300 ~= http.statusCode else {
+                    // A 404/410 is a valid "not in this catalog" response; only
+                    // transport/server failures should be reported as unavailable.
+                    if http.statusCode >= 500 { sawNetworkFailure = true }
+                    continue
+                }
+                let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+                guard envelope.status != 0, let remote = envelope.product else {
+                    continue
+                }
+                return .product(makeProduct(barcode: barcode, remote: remote, source: endpoint.source))
+            } catch is CancellationError {
+                return .notFound
+            } catch {
+                sawNetworkFailure = true
+            }
+        }
+        return sawNetworkFailure ? .networkFailure : .notFound
     }
 
     private static func makeProduct(barcode: String, remote: RemoteProduct, source: String) -> SiftProduct {
@@ -368,7 +445,7 @@ enum SiftLookupService {
             ingredients: analysis.insights,
             score: analysis.score,
             source: source,
-            imageURL: remote.imageURL
+            imageURL: remote.imageURLString.flatMap(URL.init(string:))
         )
     }
 
