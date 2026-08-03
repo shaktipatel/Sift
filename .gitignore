@@ -9,3 +9,4 @@ build/
 .xcode-derived/
 .xcode-derived-*/
 SiftDistribution.csr
+private_keys/
