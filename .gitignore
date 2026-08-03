@@ -1,0 +1,11 @@
+.DS_Store
+.module-cache/
+.build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+build/
+.xcode-derived/
+.xcode-derived-*/
+SiftDistribution.csr
