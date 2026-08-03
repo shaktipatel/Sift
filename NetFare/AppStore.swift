@@ -358,6 +358,7 @@ enum SiftLookupService {
         ]
 
         var sawNetworkError = false
+        var sawCatalogResponse = false
         let foundProduct: SiftProduct? = await withTaskGroup(of: FetchOutcome.self, returning: SiftProduct?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
@@ -373,7 +374,7 @@ enum SiftLookupService {
                 case .networkFailure:
                     sawNetworkError = true
                 case .notFound:
-                    continue
+                    sawCatalogResponse = true
                 }
             }
             return nil
@@ -385,7 +386,9 @@ enum SiftLookupService {
 
         return SiftLookupResult(
             product: nil,
-            errorMessage: sawNetworkError
+            errorMessage: sawCatalogResponse
+                ? "No product was found for this barcode. Paste the ingredients to check them."
+                : sawNetworkError
                 ? "The product database is temporarily unavailable. Check your connection and try again, or paste the ingredients instead."
                 : "No product was found for this barcode. Paste the ingredients to check them."
         )
@@ -393,6 +396,7 @@ enum SiftLookupService {
 
     private static func fetch(barcode: String, endpoint: Endpoint) async -> FetchOutcome {
         var sawNetworkFailure = false
+        var sawValidResponse = false
         for base in endpoint.bases {
             guard let url = URL(string: "\(base)\(barcode).json?product_type=all&lc=en&fields=product_name,product_name_en,brands,categories_tags,ingredients_text,ingredients_text_en,image_url") else {
                 continue
@@ -414,9 +418,14 @@ enum SiftLookupService {
                 guard 200..<300 ~= http.statusCode else {
                     // A 404/410 is a valid "not in this catalog" response; only
                     // transport/server failures should be reported as unavailable.
-                    if http.statusCode >= 500 { sawNetworkFailure = true }
+                    if (400..<500).contains(http.statusCode) {
+                        sawValidResponse = true
+                    } else if http.statusCode >= 500 {
+                        sawNetworkFailure = true
+                    }
                     continue
                 }
+                sawValidResponse = true
                 let envelope = try JSONDecoder().decode(Envelope.self, from: data)
                 guard envelope.status != 0, let remote = envelope.product else {
                     continue
@@ -428,7 +437,7 @@ enum SiftLookupService {
                 sawNetworkFailure = true
             }
         }
-        return sawNetworkFailure ? .networkFailure : .notFound
+        return sawValidResponse || !sawNetworkFailure ? .notFound : .networkFailure
     }
 
     private static func makeProduct(barcode: String, remote: RemoteProduct, source: String) -> SiftProduct {
